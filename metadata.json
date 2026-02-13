@@ -1,0 +1,5 @@
+{
+  "name": "ManhwaNovel Reader AI",
+  "description": "Extracts, translates, and narrates web novels using Gemini AI.",
+  "requestFramePermissions": []
+}
