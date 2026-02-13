@@ -1,28 +1,99 @@
 import { GoogleGenAI, Modality } from "@google/genai";
 import { StoryContent, BookDetails, Chapter } from "../types";
 
-const apiKey = process.env.API_KEY;
-if (!apiKey) {
-  console.error("API_KEY is missing. Please ensure it is set in the environment.");
-}
+const LOCAL_STORAGE_KEY_API = 'user_custom_api_key';
 
-const ai = new GoogleGenAI({ apiKey: apiKey || 'dummy-key-for-build' });
+// Internal mutable instance
+let aiClient: GoogleGenAI | null = null;
+
+const getEnvApiKey = (): string => {
+  // 1. Try Vite standard (import.meta.env)
+  try {
+    // @ts-ignore
+    if (typeof import.meta !== 'undefined' && import.meta.env) {
+      // @ts-ignore
+      if (import.meta.env.VITE_API_KEY) return import.meta.env.VITE_API_KEY;
+      // @ts-ignore
+      if (import.meta.env.API_KEY) return import.meta.env.API_KEY;
+    }
+  } catch (e) {}
+
+  // 2. Try Standard process.env (Webpack, CRA, Next.js, Node)
+  if (typeof process !== 'undefined' && process.env) {
+    if (process.env.API_KEY) return process.env.API_KEY;
+    if (process.env.NEXT_PUBLIC_API_KEY) return process.env.NEXT_PUBLIC_API_KEY;
+    if (process.env.REACT_APP_API_KEY) return process.env.REACT_APP_API_KEY;
+  }
+
+  return '';
+};
+
+// Initialize AI Client with the best available key
+const initializeAI = () => {
+  let key = '';
+  
+  // 1. Check Local Storage (User override)
+  if (typeof window !== 'undefined') {
+    const stored = localStorage.getItem(LOCAL_STORAGE_KEY_API);
+    if (stored) key = stored;
+  }
+
+  // 2. Check Env if no custom key
+  if (!key) {
+    key = getEnvApiKey();
+  }
+
+  // 3. Fallback
+  if (!key) {
+    console.warn("No API Key found in Env or Storage. Calls will fail.");
+  }
+  
+  // Re-create instance
+  aiClient = new GoogleGenAI({ apiKey: key || 'missing-key' });
+};
+
+// Initial setup
+initializeAI();
 
 /**
- * Helper to clean JSON strings wrapped in markdown code blocks
+ * Updates the API Key from the UI and re-initializes the client.
  */
+export const setCustomApiKey = (key: string) => {
+  if (typeof window !== 'undefined') {
+    if (key) {
+      localStorage.setItem(LOCAL_STORAGE_KEY_API, key);
+    } else {
+      localStorage.removeItem(LOCAL_STORAGE_KEY_API);
+    }
+  }
+  initializeAI();
+};
+
+export const getCustomApiKey = (): string => {
+    if (typeof window !== 'undefined') return localStorage.getItem(LOCAL_STORAGE_KEY_API) || '';
+    return '';
+}
+
+/**
+ * Helper to ensure we always use the current instance
+ */
+const getAI = () => {
+  if (!aiClient) initializeAI();
+  return aiClient!;
+};
+
+// --- Utilities ---
+
 function cleanAndParseJSON(text: string): any {
   let cleanText = text.trim();
-  // Remove markdown code blocks if present (e.g., ```json ... ```)
   if (cleanText.startsWith('```')) {
     cleanText = cleanText.replace(/^```(json)?|```$/g, '').trim();
   }
   return JSON.parse(cleanText);
 }
 
-/**
- * Fetches book details.
- */
+// --- API Functions ---
+
 export async function fetchBookDetails(url: string): Promise<BookDetails> {
   const prompt = `
     Act as a Web Scraper.
@@ -43,8 +114,8 @@ export async function fetchBookDetails(url: string): Promise<BookDetails> {
     }
   `;
 
-  // Use Flash for metadata as it's faster and sufficient
-  const response = await ai.models.generateContent({
+  // Use Flash for metadata
+  const response = await getAI().models.generateContent({
     model: "gemini-3-flash-preview",
     contents: prompt,
     config: {
@@ -54,7 +125,7 @@ export async function fetchBookDetails(url: string): Promise<BookDetails> {
   });
 
   const text = response.text;
-  if (!text) throw new Error("No se pudo analizar la novela.");
+  if (!text) throw new Error("No se pudo analizar la novela. Verifica tu API Key o la URL.");
 
   try {
     const data = JSON.parse(text);
@@ -92,10 +163,6 @@ export async function fetchBookDetails(url: string): Promise<BookDetails> {
   }
 }
 
-/**
- * Extracts and translates content. 
- * STRATEGY: Try Pro first (Quality). If it fails/timeouts, Fallback to Flash (Speed).
- */
 export async function processContent(input: string, mode: 'url' | 'text'): Promise<StoryContent> {
   
   const generatePrompt = (isPro: boolean) => {
@@ -139,10 +206,10 @@ export async function processContent(input: string, mode: 'url' | 'text'): Promi
     }
   };
 
-  // 1. Try with Gemini 3 Pro (Best Quality)
+  // 1. Try with Gemini 3 Pro
   try {
     console.log("Attempting extraction with Gemini 3 Pro...");
-    const response = await ai.models.generateContent({
+    const response = await getAI().models.generateContent({
       model: "gemini-3-pro-preview",
       contents: generatePrompt(true),
       config: {
@@ -155,14 +222,15 @@ export async function processContent(input: string, mode: 'url' | 'text'): Promi
       const json = cleanAndParseJSON(response.text);
       if (json.translatedText) return normalizeResponse(json, input, mode);
     }
-  } catch (e) {
+  } catch (e: any) {
     console.warn("Gemini 3 Pro failed or timed out. Falling back to Flash.", e);
+    if (e.message?.includes('API key') || e.toString().includes('400')) throw e; // Don't fallback on auth errors
   }
 
-  // 2. Fallback: Gemini 3 Flash (High Speed/Reliability)
+  // 2. Fallback: Gemini 3 Flash
   try {
     console.log("Fallback extraction with Gemini 3 Flash...");
-    const response = await ai.models.generateContent({
+    const response = await getAI().models.generateContent({
       model: "gemini-3-flash-preview",
       contents: generatePrompt(false),
       config: {
@@ -176,8 +244,11 @@ export async function processContent(input: string, mode: 'url' | 'text'): Promi
     const json = cleanAndParseJSON(response.text);
     return normalizeResponse(json, input, mode);
 
-  } catch (e) {
+  } catch (e: any) {
     console.error("Final extraction error", e);
+    if (e.message?.includes('API key') || e.toString().includes('400')) {
+        throw new Error("API Key inválida. Por favor configura tu clave en Ajustes.");
+    }
     throw new Error("No se pudo extraer el capítulo. Intente de nuevo o pegue el texto manualmente.");
   }
 }
@@ -199,7 +270,7 @@ export async function generateSpeechFromText(text: string): Promise<string> {
     safeText = text.substring(0, charLimit) + "...";
   }
 
-  const response = await ai.models.generateContent({
+  const response = await getAI().models.generateContent({
     model: "gemini-2.5-flash-preview-tts",
     contents: [{ parts: [{ text: safeText }] }],
     config: {
